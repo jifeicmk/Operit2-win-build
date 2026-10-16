@@ -14,6 +14,7 @@ from common import (
     flutter_command,
     flutter_pub_get,
     generate_dart_proxy_artifacts,
+    prepare_python_command,
     read_properties,
     require_command,
     run,
@@ -111,6 +112,7 @@ def main() -> int:
     require_command("cargo")
     if not args.skip_proxy_generation:
         generate_dart_proxy_artifacts()
+    prepare_python_command()
     ensure_typescript(TYPESCRIPT_VERSION)
     flutter_pub_get(enforce_lockfile=args.enforce_lockfile)
     # Omit `--no-pub` on purpose: this build rewrites GeneratedPluginRegistrant.java
