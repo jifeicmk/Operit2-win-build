@@ -8,6 +8,7 @@ from common import (
     DIST_DIR,
     FLUTTER_APP_DIR,
     compress_zip,
+    ensure_typescript,
     flutter_command,
     flutter_pub_get,
     generate_dart_proxy_artifacts,
@@ -16,6 +17,9 @@ from common import (
     require_command,
     run,
 )
+
+# Version of the repository-managed TypeScript compiler used by the plugin/codegen tooling.
+TYPESCRIPT_VERSION = "5.9.3"
 
 
 # Parses command-line options for the Windows Flutter build.
@@ -37,6 +41,7 @@ def main() -> int:
     if not args.skip_proxy_generation:
         generate_dart_proxy_artifacts()
     prepare_python_command()
+    ensure_typescript(TYPESCRIPT_VERSION)
     flutter_pub_get(enforce_lockfile=args.enforce_lockfile)
     command = [flutter_command(), "build", "windows", "--release", "--no-pub"]
     # TEMP-DIAGNOSTIC: verbose output to surface the artifact download failure.
