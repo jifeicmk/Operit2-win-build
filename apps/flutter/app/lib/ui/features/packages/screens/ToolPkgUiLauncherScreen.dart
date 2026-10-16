@@ -1,0 +1,1195 @@
+// ignore_for_file: file_names
+
+import 'dart:async';
+import 'ComposeDslImageSource.dart';
+import '../../../../core/application/PluginHotReload.dart';
+import 'dart:math' as math;
+
+import 'package:flutter/foundation.dart'
+    show listEquals, debugPrintSynchronously;
+import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
+import 'package:flutter/services.dart';
+import '../../../common/components/PageActivityMixin.dart';
+import '../../../../core/link/CoreLinkProtocol.dart';
+import '../../../../core/logging/ClientLogger.dart';
+import '../../../../core/theme/PluginThemeSnapshot.dart';
+
+import '../../../../core/proxy/generated/CoreProxyClients.g.dart';
+import '../../../../core/proxy/generated/CoreProxyModels.g.dart' as core_proxy;
+import '../../../common/components/AdaptiveSidePanel.dart';
+import '../../../common/components/M3LoadingIndicator.dart';
+import '../../../common/icons/MaterialIconNameResolver.dart';
+import '../../../common/markdown/StreamMarkdownRenderer.dart';
+import '../../../main/navigation/AppNavigationModels.dart';
+import '../../chat/screens/AIChatScreen.dart';
+import '../utils/PackageDisplayUtils.dart';
+import 'ToolPkgComposeDslWebView.dart';
+import 'compose_dsl/fill_layout.dart';
+import 'compose_dsl/lazy_viewport.dart';
+import 'compose_dsl/action_scheduler.dart';
+import 'compose_dsl/execution_owner.dart';
+import '../../../common/components/SwipeActions.dart';
+
+part 'compose_dsl/compose_host.dart';
+part 'compose_dsl/dialog_host.dart';
+part 'compose_dsl/lazy_list.dart';
+part 'compose_dsl/gesture_region.dart';
+part 'compose_dsl/text_field.dart';
+part 'compose_dsl/canvas_painter.dart';
+part 'compose_dsl/size_reporting.dart';
+part 'compose_dsl/render_models.dart';
+part 'compose_dsl/retained_nodes.dart';
+part 'compose_dsl/modifiers.dart';
+part 'compose_dsl/value_parsers.dart';
+part 'compose_dsl/renderer.dart';
+part 'compose_dsl/hover_region.dart';
+part 'compose_dsl/drag_drop.dart';
+part 'compose_dsl/box_layout.dart';
+part 'compose_dsl/flex_layout.dart';
+part 'compose_dsl/desktop_widget.dart';
+part 'compose_dsl/material_controls.dart';
+part 'compose_dsl/navigation_nodes.dart';
+part 'compose_dsl/interactive_nodes.dart';
+part 'compose_dsl/renderer_slots.dart';
+part 'compose_dsl/image.dart';
+part 'compose_dsl/pager.dart';
+
+class ToolPkgUiLauncherScreen extends StatefulWidget {
+  /// Creates a routable or embedded screen using the existing Compose host.
+  const ToolPkgUiLauncherScreen({
+    super.key,
+    required this.clients,
+    required this.plugin,
+    this.initialRouteId,
+    this.embeddedScreenPath,
+    this.showLauncherChrome = true,
+    this.showLoadingIndicator = true,
+    this.dialogTitle,
+    this.initialState = const <String, Object?>{},
+    this.initialMemo = const <String, Object?>{},
+    this.initialModuleSpec,
+    this.onActionResult,
+  });
+
+  final GeneratedCoreProxyClients clients;
+  final core_proxy.ToolPkgContainerRuntime plugin;
+  final String? initialRouteId;
+
+  /// Identifies an embedded script independently of plugin-provided module metadata.
+  final String? embeddedScreenPath;
+  final bool showLauncherChrome;
+  final bool showLoadingIndicator;
+
+  /// Embeds the screen in the modal route owned by its caller.
+  final String? dialogTitle;
+  final Map<String, Object?> initialState;
+  final Map<String, Object?> initialMemo;
+  final Map<String, Object?>? initialModuleSpec;
+
+  /// Delivers completed plugin actions to the owner of an embedded surface.
+  final ValueChanged<Object?>? onActionResult;
+
+  /// Creates the state that owns the plugin execution and render lifecycle.
+  @override
+  State<ToolPkgUiLauncherScreen> createState() =>
+      _ToolPkgUiLauncherScreenState();
+}
+
+/// Logs loading stages only when plugin UI profiling is explicitly enabled.
+/// Frame completion is a Flutter tree measurement, not a GPU presentation timestamp.
+class _ToolPkgUiLoadTiming {
+  /// Starts the optional profiling clock for one UI load.
+  _ToolPkgUiLoadTiming(
+    this.label, {
+    bool firstLoad = false,
+    int? queueWaitMicros,
+    int? startedAfterMicros,
+  }) : _watch = const bool.fromEnvironment('OPERIT_PROFILE_PLUGIN_UI')
+           ? (Stopwatch()..start())
+           : null {
+    if (_watch != null && queueWaitMicros != null) {
+      ClientLogger.i(
+        'event=compose_load_begin $label firstLoad=$firstLoad '
+        'queueMs=${(queueWaitMicros / 1000).toStringAsFixed(3)} '
+        'startedAfterMs=${(startedAfterMicros! / 1000).toStringAsFixed(3)}',
+        tag: 'ToolPkgUiLauncher',
+      );
+    }
+  }
+
+  final String label;
+  final Stopwatch? _watch;
+  int _previousMicros = 0;
+
+  /// Measures each operation independently when loading stages overlap.
+  Future<T> measure<T>(String stage, Future<T> Function() operation) async {
+    final startedMicros = _watch?.elapsedMicroseconds;
+    final result = await operation();
+    mark(stage, startedMicros: startedMicros);
+    return result;
+  }
+
+  /// Records a loading stage while plugin UI profiling is enabled.
+  void mark(String stage, {int? startedMicros}) {
+    final watch = _watch;
+    if (watch == null) return;
+    final elapsed = watch.elapsedMicroseconds;
+    ClientLogger.i(
+      'event=compose_load_stage $label stage=$stage '
+      'stepMs=${((elapsed - (startedMicros ?? _previousMicros)) / 1000).toStringAsFixed(1)} '
+      'totalMs=${(elapsed / 1000).toStringAsFixed(1)}',
+      tag: 'ToolPkgUiLauncher',
+    );
+    _previousMicros = elapsed;
+  }
+}
+
+class _ToolPkgUiLauncherScreenState extends State<ToolPkgUiLauncherScreen> {
+  static const String _logTag = 'ToolPkgUiLauncher';
+
+  late final String _executionOwnerId = ComposeDslExecutionOwner.allocate();
+  late final String _selectedRouteId = _initialRouteId();
+  _ComposeDslRenderResult? _renderResult;
+  String? _scriptScreenPath;
+  ({
+    String uiModuleId,
+    String? embeddedScreenPath,
+    String script,
+    String? screenPath,
+  })?
+  _composeScript;
+  ({String contextKey, String containerPackageName})? _activeExecutionContext;
+  bool _loading = true;
+  bool _loadedInitialRoute = false;
+  int _routeLoadGeneration = 0;
+  int _actionOwnerGeneration = 0;
+  String _currentLanguageTag = 'en';
+  ColorScheme? _themeScheme;
+  String? _error;
+  final _actionScheduler = ComposeDslActionScheduler();
+  Future<void>? _renderTail;
+  Future<void> _reloadTail = Future<void>.value();
+  int _reloadGeneration = 0;
+  bool _reloading = false;
+  final _ComposeDslNodeStore _nodeStore = _ComposeDslNodeStore();
+  final Map<String, _ComposeDslPendingCommand> _composePending = {};
+  String? _composeSessionId;
+  Object? _composeSessionError;
+  StackTrace? _composeSessionErrorStack;
+  bool _composeHasRendered = false;
+  final _firstTreeWatch = Stopwatch();
+  bool _firstTreeFrameReported = false;
+  bool _firstTreeFrameScheduled = false;
+  StreamController<core_proxy.ToolPkgComposeDslCommand>? _composeCommands;
+  StreamSubscription<core_proxy.ToolPkgComposeDslEvent>? _composeUpdates;
+  Future<void>? _composeSubmission;
+  int _nextComposeRequestId = 0;
+
+  GeneratedApplicationPackageManagerCoreProxy get _packageManager =>
+      widget.clients.application.packageManager();
+
+  /// Registers the screen lifecycle and starts explicitly requested UI profiling.
+  @override
+  void initState() {
+    super.initState();
+    if (const bool.fromEnvironment('OPERIT_PROFILE_PLUGIN_UI')) {
+      _firstTreeWatch.start();
+    }
+    ComposeDslWebViewHostRegistry.ensureHostInteractionRegistered();
+    PluginHotReload.revision.addListener(_reloadDevelopmentPackage);
+  }
+
+  /// Updates an embedded XML screen without destroying its tree or JS context.
+  @override
+  void didUpdateWidget(covariant ToolPkgUiLauncherScreen oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (!_reloading &&
+        (!_composeInputEquals(oldWidget.initialState, widget.initialState) ||
+            !_composeInputEquals(oldWidget.initialMemo, widget.initialMemo) ||
+            (widget.embeddedScreenPath == null &&
+                !_composeInputEquals(
+                  oldWidget.initialModuleSpec,
+                  widget.initialModuleSpec,
+                )))) {
+      unawaited(_loadRoute(updateInputs: true));
+    }
+  }
+
+  /// Recreates the page-owned Compose session after Flutter hot reload.
+  @override
+  void reassemble() {
+    super.reassemble();
+    _reloadDevelopmentPackage();
+  }
+
+  /// Retires old request ownership before either stream closes during a reload.
+  void _reloadDevelopmentPackage() {
+    if (!mounted) return;
+    final generation = ++_reloadGeneration;
+    _routeLoadGeneration++;
+    _actionOwnerGeneration++;
+    _reloading = true;
+    _failComposeCommands(StateError('Compose session reloading'));
+    setState(() {
+      _renderResult = null;
+      _loading = true;
+      _error = null;
+    });
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      // Coalesce notifications in the same frame, and never overlap an old
+      // engine's release with acquisition of its replacement under the same key.
+      _reloadTail = _reloadTail
+          .then((_) async {
+            if (!mounted || generation != _reloadGeneration) return;
+            await _renderTail;
+            if (!mounted || generation != _reloadGeneration) return;
+            final executionContext = _activeExecutionContext;
+            _activeExecutionContext = null;
+            if (executionContext != null) {
+              await _releaseExecutionContext(executionContext);
+            }
+            if (!mounted || generation != _reloadGeneration) return;
+            _reloading = false;
+            await _loadRoute();
+          })
+          .catchError((Object error, StackTrace stackTrace) {
+            if (!mounted || generation != _reloadGeneration) return;
+            _reloading = false;
+            _printComposeError('reload', error, stackTrace);
+            setState(() {
+              _error = error.toString();
+              _loading = false;
+            });
+          });
+    });
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final scheme = Theme.of(context).colorScheme;
+    final themeChanged = _themeScheme != scheme;
+    _themeScheme = scheme;
+    final languageTag = _resolveCurrentLanguage();
+    final shouldLoadRoute =
+        !_loadedInitialRoute || languageTag != _currentLanguageTag;
+    _currentLanguageTag = languageTag;
+    if (shouldLoadRoute) {
+      _loadedInitialRoute = true;
+      // Start the first resource requests while this page is being mounted.
+      // Only renders already in flight need to wait on the render tail.
+      if (!_reloading) unawaited(_loadRoute());
+    } else if (themeChanged) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && !_loading) unawaited(_notifyThemeChanged());
+      });
+    }
+  }
+
+  /// Sends the current UI theme through the normal serialized plugin action lifecycle.
+  Future<void> _notifyThemeChanged() async {
+    final scheme = _themeScheme!;
+    final uiModuleId = _selectedUiModuleId();
+    final routeInstanceId = _selectedRouteInstanceId();
+    final executionContextKey = _executionContextKey(
+      uiModuleId: uiModuleId,
+      routeInstanceId: routeInstanceId,
+    );
+    ClientLogger.i(
+      'event=theme_dispatch_start package=${widget.plugin.packageName} '
+      'context=$executionContextKey brightness=${scheme.brightness.name} '
+      'primary=${scheme.primary.toARGB32().toRadixString(16)}',
+      tag: _logTag,
+    );
+    try {
+      await _dispatchAction(
+        '__operit_theme_changed',
+        pluginThemeSnapshot(scheme),
+      );
+      ClientLogger.i(
+        'event=theme_dispatch_done package=${widget.plugin.packageName} '
+        'context=$executionContextKey',
+        tag: _logTag,
+      );
+    } catch (error, stackTrace) {
+      ClientLogger.e(
+        'event=theme_dispatch_failed package=${widget.plugin.packageName} '
+        'context=$executionContextKey',
+        tag: _logTag,
+        error: error,
+        stackTrace: stackTrace,
+      );
+      rethrow;
+    }
+  }
+
+  String _initialRouteId() {
+    final requested = widget.initialRouteId?.trim();
+    if (requested != null && requested.isNotEmpty) {
+      if (_embeddedScreenPath() != null) {
+        return requested;
+      }
+      final matched = widget.plugin.uiRoutes.any(
+        (route) => route.routeId == requested || route.id == requested,
+      );
+      final moduleMatched = widget.plugin.uiModules.any(
+        (module) => module.id == requested,
+      );
+      if (matched || moduleMatched) {
+        return requested;
+      }
+    }
+    if (widget.plugin.uiRoutes.isNotEmpty) {
+      return widget.plugin.uiRoutes.first.routeId;
+    }
+    if (widget.plugin.uiModules.isNotEmpty) {
+      return widget.plugin.uiModules.first.id;
+    }
+    return '';
+  }
+
+  /// Serializes renders and invalidates superseded XML updates.
+  Future<void> _loadRoute({bool updateInputs = false}) async {
+    if (!updateInputs) _actionOwnerGeneration++;
+    final generation = ++_routeLoadGeneration;
+    final queued = Stopwatch()..start();
+    Future<void> render() async {
+      queued.stop();
+      await _loadRouteCore(
+        generation,
+        updateInputs: updateInputs,
+        queueWaitMicros: queued.elapsedMicroseconds,
+      );
+    }
+
+    final previous = _renderTail;
+    final pending = previous == null
+        ? render()
+        : previous.then((_) => render());
+    _renderTail = pending;
+    try {
+      await pending;
+    } finally {
+      if (identical(_renderTail, pending)) _renderTail = null;
+    }
+  }
+
+  /// Renders the latest input while preserving an already visible DSL tree.
+  Future<void> _loadRouteCore(
+    int routeLoadGeneration, {
+    required bool updateInputs,
+    required int queueWaitMicros,
+  }) async {
+    if (!_isCurrentRouteLoad(routeLoadGeneration)) {
+      return;
+    }
+    final uiModuleId = _selectedUiModuleId();
+    final routeInstanceId = _selectedRouteInstanceId();
+    final executionContextKey = _executionContextKey(
+      uiModuleId: uiModuleId,
+      routeInstanceId: routeInstanceId,
+    );
+    final executionContext = (
+      contextKey: executionContextKey,
+      containerPackageName: widget.plugin.packageName,
+    );
+    final timing = _ToolPkgUiLoadTiming(
+      'package=${widget.plugin.packageName} route=$uiModuleId '
+      'context=$executionContextKey load=$routeLoadGeneration updateInputs=$updateInputs',
+      firstLoad: !_composeHasRendered,
+      queueWaitMicros: queueWaitMicros,
+      startedAfterMicros: _firstTreeWatch.elapsedMicroseconds,
+    );
+    // Initial mounting already has loading=true; avoid dirtying an element
+    // during dependency resolution just to assign the same values.
+    final loading = !updateInputs || _renderResult == null;
+    if (_loading != loading || _error != null) {
+      setState(() {
+        _loading = loading;
+        _error = null;
+      });
+    }
+    try {
+      final previousExecutionContext = _activeExecutionContext;
+      if (previousExecutionContext != null &&
+          previousExecutionContext != executionContext) {
+        _activeExecutionContext = null;
+        await _releaseExecutionContext(previousExecutionContext);
+        if (!_isCurrentRouteLoad(routeLoadGeneration)) {
+          return;
+        }
+      }
+      final acquireContext = _activeExecutionContext != executionContext;
+      if (acquireContext) _activeExecutionContext = executionContext;
+      final scriptFuture = timing.measure(
+        'read-script',
+        () => _readComposeScript(uiModuleId),
+      );
+      // Script resources do not depend on the page engine or session. Await
+      // both tasks together so either failure is handled by this route load.
+      await Future.wait<void>([
+        if (acquireContext) _acquireExecutionContext(executionContext, timing),
+        scriptFuture.then<void>((_) {}),
+      ]);
+      if (!_isCurrentRouteLoad(routeLoadGeneration)) {
+        if (acquireContext && _activeExecutionContext != executionContext) {
+          await _releaseExecutionContext(executionContext);
+        }
+        return;
+      }
+      final entry = await scriptFuture;
+      _composeScript = entry;
+      _scriptScreenPath = entry.screenPath;
+      final renderedTheme = _themeScheme;
+      final command = await _submitComposeCommand(
+        operation: 'render',
+        script: entry.script,
+        runtimeOptions: _runtimeOptions(
+          uiModuleId: uiModuleId,
+          routeInstanceId: routeInstanceId,
+          executionContextKey: executionContextKey,
+          updateInputs: updateInputs,
+          initializeState: !_composeHasRendered,
+        ),
+      );
+      if (!_isCurrentRouteLoad(routeLoadGeneration)) return;
+      timing.mark('render-command');
+      _composeHasRendered = true;
+      if (_renderResult == null) {
+        throw StateError('Compose render completed without a root node');
+      }
+      setState(() {
+        _loading = false;
+      });
+      _reportFirstTreeFrame();
+      if (_themeScheme != renderedTheme) {
+        _scheduleThemeDispatchAfterRouteRender(routeLoadGeneration);
+      }
+      _navigateCommands(command.navigationCommands);
+    } catch (error, stackTrace) {
+      if (!_isCurrentRouteLoad(routeLoadGeneration)) {
+        return;
+      }
+      _printComposeError('render', error, stackTrace);
+      setState(() {
+        _error = error.toString();
+        _loading = false;
+      });
+    }
+  }
+
+  /// Reuses immutable script text within one page session; release clears it.
+  Future<
+    ({
+      String uiModuleId,
+      String? embeddedScreenPath,
+      String script,
+      String? screenPath,
+    })
+  >
+  _readComposeScript(String uiModuleId) async {
+    final embeddedScreenPath = _embeddedScreenPath();
+    final cached = _composeScript;
+    if (cached != null &&
+        cached.uiModuleId == uiModuleId &&
+        cached.embeddedScreenPath == embeddedScreenPath) {
+      return cached;
+    }
+    final String? script;
+    final String? screenPath;
+    if (embeddedScreenPath != null) {
+      script = await _packageManager.readToolPkgTextResource(
+        packageNameOrSubpackageId: widget.plugin.packageName,
+        resourcePath: embeddedScreenPath,
+        preferEnabledContainer: true,
+      );
+      screenPath = embeddedScreenPath;
+    } else {
+      final entry = await Future.wait<String?>([
+        _packageManager.getToolPkgComposeDslScript(
+          containerPackageName: widget.plugin.packageName,
+          uiModuleId: uiModuleId,
+        ),
+        _packageManager.getToolPkgComposeDslScreenPath(
+          containerPackageName: widget.plugin.packageName,
+          uiModuleId: uiModuleId,
+        ),
+      ]);
+      script = entry[0];
+      screenPath = entry[1];
+    }
+    if (script == null || script.trim().isEmpty) {
+      if (embeddedScreenPath != null) {
+        throw StateError(
+          'compose_dsl screen not found: '
+          'package=${widget.plugin.packageName}, screen=$embeddedScreenPath',
+        );
+      }
+      throw StateError(
+        'compose_dsl script not found: '
+        'package=${widget.plugin.packageName}, module=$uiModuleId',
+      );
+    }
+    return (
+      uiModuleId: uiModuleId,
+      embeddedScreenPath: embeddedScreenPath,
+      script: script,
+      screenPath: screenPath,
+    );
+  }
+
+  /// Measures first committed DSL-tree frame, including any initial render queue.
+  /// A prewarmed sidebar can complete this while its presentation is hidden.
+  void _reportFirstTreeFrame() {
+    if (!const bool.fromEnvironment('OPERIT_PROFILE_PLUGIN_UI')) return;
+    if (_firstTreeFrameReported || _firstTreeFrameScheduled) return;
+    _firstTreeFrameScheduled = true;
+    final treeReadyMicros = _firstTreeWatch.elapsedMicroseconds;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _firstTreeFrameScheduled = false;
+      if (!mounted ||
+          _loading ||
+          _renderResult == null ||
+          _firstTreeFrameReported) {
+        return;
+      }
+      _firstTreeFrameReported = true;
+      _firstTreeWatch.stop();
+      ClientLogger.i(
+        'event=compose_first_tree_frame package=${widget.plugin.packageName} '
+        'route=$_selectedRouteId context=${_activeExecutionContext?.contextKey} '
+        'load=$_routeLoadGeneration elapsedMs=${_firstTreeWatch.elapsedMilliseconds} '
+        'wallMicros=${DateTime.now().microsecondsSinceEpoch} '
+        'frameWaitMs=${((_firstTreeWatch.elapsedMicroseconds - treeReadyMicros) / 1000).toStringAsFixed(3)} '
+        'prepared=${widget.initialState['chatSidebarPrepared'] != null} '
+        'tickerEnabled=${TickerMode.valuesOf(context).enabled}',
+        tag: _logTag,
+      );
+    });
+  }
+
+  bool _isCurrentRouteLoad(int routeLoadGeneration) {
+    return mounted && routeLoadGeneration == _routeLoadGeneration;
+  }
+
+  /// Dispatches a theme change after Flutter has bound controllers from the new tree.
+  void _scheduleThemeDispatchAfterRouteRender(int routeLoadGeneration) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_isCurrentRouteLoad(routeLoadGeneration) && !_loading) {
+        unawaited(_notifyThemeChanged());
+      }
+    });
+  }
+
+  /// Acquires one page-owned ToolPkg execution context.
+  Future<void> _acquireExecutionContext(
+    ({String contextKey, String containerPackageName}) executionContext,
+    _ToolPkgUiLoadTiming timing,
+  ) async {
+    await timing.measure(
+      'acquire-engine',
+      () => _packageManager.acquireToolPkgExecutionEngine(
+        contextKey: executionContext.contextKey,
+        containerPackageName: executionContext.containerPackageName,
+      ),
+    );
+    final sessionId = await timing.measure(
+      'open-session',
+      () => _packageManager.openComposeDslSession(
+        contextKey: executionContext.contextKey,
+        containerPackageName: executionContext.containerPackageName,
+      ),
+    );
+    _composeSessionId = sessionId;
+    _composeSessionError = null;
+    _composeSessionErrorStack = null;
+    _composeHasRendered = false;
+    _composeScript = null;
+    final session = widget.clients.servicesComposeDslSessionService;
+    _composeUpdates = session
+        .updates(sessionId: sessionId)
+        .listen(
+          // The subscription owns the session lease, including callbacks from completed actions.
+          (event) {
+            if (mounted && !_reloading && _composeSessionId == sessionId) {
+              _receiveComposeEvent(event);
+            }
+          },
+          onError: (Object error, StackTrace stackTrace) {
+            if (mounted && !_reloading && _composeSessionId == sessionId) {
+              _failComposeCommands(error, stackTrace);
+            }
+          },
+          onDone: () {
+            if (mounted && !_reloading && _composeSessionId == sessionId) {
+              _failComposeCommands(
+                StateError('Compose session update stream closed'),
+              );
+            }
+          },
+        );
+    final commands = StreamController<core_proxy.ToolPkgComposeDslCommand>();
+    _composeCommands = commands;
+    _composeSubmission = session
+        .submit(sessionId: sessionId, commands: commands.stream)
+        .catchError((Object error, StackTrace stackTrace) {
+          if (mounted && !_reloading && _composeSessionId == sessionId) {
+            _failComposeCommands(error, stackTrace);
+          }
+        });
+  }
+
+  /// Closes this page's two streams before releasing its existing engine ownership.
+  Future<void> _releaseExecutionContext(
+    ({String contextKey, String containerPackageName}) executionContext,
+  ) async {
+    final commands = _composeCommands;
+    final updates = _composeUpdates;
+    final submission = _composeSubmission;
+    _composeCommands = null;
+    _composeUpdates = null;
+    _composeSubmission = null;
+    _composeSessionId = null;
+    _composeScript = null;
+    _scriptScreenPath = null;
+    _failComposeCommands(StateError('Compose execution context released'));
+    _composePending.clear();
+    if (commands != null) await commands.close();
+    if (submission != null) await submission;
+    if (updates != null) await updates.cancel();
+    await _packageManager.releaseToolPkgExecutionEngine(
+      contextKey: executionContext.contextKey,
+      containerPackageName: executionContext.containerPackageName,
+    );
+  }
+
+  /// Applies every live session commit independently of its initiating action's completion.
+  void _applyComposeEventUpdate(core_proxy.ToolPkgComposeDslEvent event) {
+    final oldRoot = _renderResult?.tree;
+    final update = event.update;
+    if (update != null) {
+      final watch = const bool.fromEnvironment('OPERIT_PROFILE_COMPOSE_STAGES')
+          ? (Stopwatch()..start())
+          : null;
+      _nodeStore.apply(update);
+      if (watch != null) {
+        debugPrintSynchronously(
+          'event=compose_pipeline_stage stage=dart-node-apply '
+          'durationMs=${(watch.elapsedMicroseconds / 1000).toStringAsFixed(3)} '
+          'wallMicros=${DateTime.now().microsecondsSinceEpoch} request=${event.requestId} '
+          'revision=${update.revision} nodes=${update.upserts.length}',
+        );
+      }
+    }
+    if (oldRoot == null && update == null) return;
+    final root = _nodeStore.root;
+    _renderResult = _ComposeDslRenderResult(
+      tree: root,
+      actionResult: event.actionResult,
+    );
+    if (!identical(oldRoot, root) || _error != null) {
+      setState(() {
+        _error = null;
+      });
+    }
+  }
+
+  /// Consumes session updates while correlating only unfinished command completions.
+  void _receiveComposeEvent(core_proxy.ToolPkgComposeDslEvent event) {
+    if (event.phase == 'sessionError') {
+      _failComposeCommands(StateError(event.error!));
+      return;
+    }
+    final pending = _composePending[event.requestId];
+    try {
+      if (event.phase == 'intermediate' || event.phase == 'final') {
+        _applyComposeEventUpdate(event);
+      }
+      if (pending == null) {
+        if (event.phase == 'intermediate' || event.phase == 'final') {
+          _navigateCommands(
+            event.navigationCommands.map(_composeNavigateCommand).toList(),
+          );
+        } else if (event.phase == 'error') {
+          final error = event.error;
+          if (error == null) {
+            throw StateError('Compose error event requires an error');
+          }
+          setState(() {
+            _error = error;
+          });
+        }
+        return;
+      }
+      if (!_isCurrentActionOwner(pending.generation)) {
+        if (event.phase == 'error' && !pending.completion.isCompleted) {
+          pending.completion.completeError(StateError(event.error!));
+        }
+        if (event.phase == 'complete') {
+          if (!pending.completion.isCompleted) pending.completion.complete();
+          _composePending.remove(event.requestId);
+        }
+        return;
+      }
+      switch (event.phase) {
+        case 'intermediate':
+        case 'final':
+          pending.actionResult = event.actionResult;
+          pending.navigationCommands.addAll(
+            event.navigationCommands.map(_composeNavigateCommand),
+          );
+          break;
+        case 'error':
+          final error = event.error;
+          if (error == null) {
+            throw StateError('Compose error event requires an error');
+          }
+          setState(() {
+            _error = error;
+          });
+          if (!pending.completion.isCompleted) {
+            pending.completion.completeError(StateError(error));
+          }
+          break;
+        case 'complete':
+          if (!pending.completion.isCompleted) pending.completion.complete();
+          _composePending.remove(event.requestId);
+          break;
+        default:
+          throw StateError('Unsupported Compose event phase: ${event.phase}');
+      }
+    } catch (error, stackTrace) {
+      if (pending != null && !pending.completion.isCompleted) {
+        pending.completion.completeError(error, stackTrace);
+      }
+      _printComposeError('event:${event.phase}', error, stackTrace);
+    }
+  }
+
+  /// Settles pending requests when either session stream reports a terminal error.
+  void _failComposeCommands(Object error, [StackTrace? stackTrace]) {
+    _composeSessionError ??= error;
+    _composeSessionErrorStack ??= stackTrace;
+    for (final pending in _composePending.values) {
+      if (!pending.completion.isCompleted) {
+        pending.completion.completeError(
+          _composeSessionError!,
+          _composeSessionErrorStack,
+        );
+      }
+    }
+  }
+
+  /// Sends an application command through the generated ReverseStream object proxy.
+  Future<_ComposeDslPendingCommand> _submitComposeCommand({
+    required String operation,
+    required Map<String, Object?> runtimeOptions,
+    String? script,
+    String? actionId,
+    Object? payload,
+  }) async {
+    final terminalError = _composeSessionError;
+    if (terminalError != null) {
+      Error.throwWithStackTrace(
+        terminalError,
+        _composeSessionErrorStack ?? StackTrace.current,
+      );
+    }
+    final commands = _composeCommands;
+    if (commands == null) {
+      throw StateError('Compose session has not been acquired');
+    }
+    final requestId = 'compose:$_executionOwnerId:${_nextComposeRequestId++}';
+    final pending = _ComposeDslPendingCommand(_actionOwnerGeneration);
+    _composePending[requestId] = pending;
+    commands.add(
+      core_proxy.ToolPkgComposeDslCommand(
+        requestId: requestId,
+        operation: operation,
+        script: script,
+        actionId: actionId,
+        payload: payload,
+        runtimeOptions: runtimeOptions,
+        envOverrides: const {},
+      ),
+    );
+    try {
+      await pending.completion.future;
+      return pending;
+    } catch (_) {
+      _composePending.remove(requestId);
+      rethrow;
+    }
+  }
+
+  /// Releases the active ToolPkg context when this page leaves the widget tree.
+  @override
+  void dispose() {
+    PluginHotReload.revision.removeListener(_reloadDevelopmentPackage);
+    _nodeStore.dispose();
+    _routeLoadGeneration += 1;
+    final executionContext = _activeExecutionContext;
+    _activeExecutionContext = null;
+    if (executionContext != null) {
+      unawaited(
+        _releaseExecutionContext(executionContext).catchError((
+          Object error,
+          StackTrace stackTrace,
+        ) {
+          _printComposeError('release', error, stackTrace);
+        }),
+      );
+    }
+    super.dispose();
+  }
+
+  /// Waits for text synchronization without serializing ordinary UI actions.
+  Future<Object?> _dispatchAction(String actionId, [Object? payload]) {
+    final routeGeneration = _actionOwnerGeneration;
+    return _actionScheduler.dispatchAction(() {
+      if (!_isCurrentActionOwner(routeGeneration)) return Future.value(null);
+      return _dispatchActionCore(
+        actionId,
+        payload,
+        reportAndSuppressErrors: true,
+        notifyActionResult: true,
+      );
+    });
+  }
+
+  /// Preserves keystroke order across all text fields in this page.
+  Future<Object?> _dispatchTextInput(String actionId, String text) {
+    final routeGeneration = _actionOwnerGeneration;
+    return _actionScheduler.dispatchTextInput(() {
+      if (!_isCurrentActionOwner(routeGeneration)) return Future.value(null);
+      return _dispatchActionCore(
+        actionId,
+        text,
+        reportAndSuppressErrors: true,
+        notifyActionResult: true,
+      );
+    });
+  }
+
+  /// Gives WebView actions the same text barrier while preserving error delivery.
+  Future<Object?> _dispatchWebViewAction(String actionId, [Object? payload]) {
+    final routeGeneration = _actionOwnerGeneration;
+    return _actionScheduler.dispatchAction(() {
+      if (!_isCurrentActionOwner(routeGeneration)) return Future.value(null);
+      return _dispatchActionCore(
+        actionId,
+        payload,
+        reportAndSuppressErrors: false,
+        notifyActionResult: false,
+      );
+    });
+  }
+
+  /// Streams render updates and settles the individual action on completion.
+  Future<Object?> _dispatchActionCore(
+    String actionId,
+    Object? payload, {
+    required bool reportAndSuppressErrors,
+    required bool notifyActionResult,
+  }) async {
+    final routeGeneration = _actionOwnerGeneration;
+    final uiModuleId = _selectedUiModuleId();
+    final routeInstanceId = _selectedRouteInstanceId();
+    final executionContextKey = _executionContextKey(
+      uiModuleId: uiModuleId,
+      routeInstanceId: routeInstanceId,
+    );
+    final timing = _ToolPkgUiLoadTiming(
+      'package=${widget.plugin.packageName} action=$actionId',
+    );
+    Object? latestActionResult;
+    final navigationCommands =
+        <({String routeId, Map<String, Object?> args})>[];
+    try {
+      final runtimeOptions = _runtimeOptions(
+        uiModuleId: uiModuleId,
+        routeInstanceId: routeInstanceId,
+        executionContextKey: executionContextKey,
+      );
+      final command = await _submitComposeCommand(
+        operation: 'action',
+        actionId: actionId,
+        payload: payload,
+        runtimeOptions: runtimeOptions,
+      );
+      timing.mark('action-command');
+      latestActionResult = command.actionResult;
+      if (!_isCurrentActionOwner(routeGeneration)) return latestActionResult;
+      navigationCommands.addAll(command.navigationCommands);
+      _navigateCommands(navigationCommands);
+      if (notifyActionResult) {
+        _notifyActionResult(
+          latestActionResult,
+          routeGeneration: routeGeneration,
+        );
+      }
+      return latestActionResult;
+    } catch (error, stackTrace) {
+      if (!_isCurrentActionOwner(routeGeneration)) {
+        return latestActionResult;
+      }
+      _printComposeError('action:$actionId', error, stackTrace);
+      setState(() {
+        _error = error.toString();
+      });
+      if (!reportAndSuppressErrors) {
+        rethrow;
+      }
+      return null;
+    }
+  }
+
+  /// Host input refreshes do not change the owner of actions already running.
+  bool _isCurrentActionOwner(int generation) =>
+      mounted && generation == _actionOwnerGeneration;
+
+  /// Delivers results only to the presentation that still owns this route load.
+  void _notifyActionResult(Object? result, {required int routeGeneration}) {
+    if (_isCurrentActionOwner(routeGeneration)) {
+      widget.onActionResult?.call(result);
+    }
+  }
+
+  /// Seeds a new JS session once; live renders and actions never echo state or memo snapshots.
+  Map<String, Object?> _runtimeOptions({
+    required String uiModuleId,
+    required String routeInstanceId,
+    required String executionContextKey,
+    bool updateInputs = false,
+    bool initializeState = false,
+  }) {
+    return <String, Object?>{
+      if (updateInputs) '__operit_update_inputs': true,
+      if (updateInputs) '__operit_input_state': widget.initialState,
+      if (const bool.fromEnvironment('OPERIT_PROFILE_COMPOSE_STAGES'))
+        '__operit_profile_compose_stages': true,
+      'packageName': widget.plugin.packageName,
+      'theme': pluginThemeSnapshot(_themeScheme!),
+      'containerPackageName': widget.plugin.packageName,
+      'toolPkgId': widget.plugin.packageName,
+      '__operit_ui_package_name': widget.plugin.packageName,
+      '__operit_ui_toolpkg_id': widget.plugin.packageName,
+      'uiModuleId': uiModuleId,
+      '__operit_ui_module_id': uiModuleId,
+      '__operit_toolpkg_runtime_kind': 'ui',
+      if (initializeState) 'state': widget.initialState,
+      if (initializeState) 'memo': widget.initialMemo,
+      'routeInstanceId': routeInstanceId,
+      '__operit_route_instance_id': routeInstanceId,
+      'executionContextKey': executionContextKey,
+      '__operit_compose_execution_context_key': executionContextKey,
+      '__operit_package_lang': _currentLanguage(),
+      '__operit_script_screen': _scriptScreenPath ?? '',
+      'moduleSpec': _moduleSpec(uiModuleId),
+    };
+  }
+
+  String _selectedUiModuleId() {
+    for (final route in widget.plugin.uiRoutes) {
+      if (route.routeId == _selectedRouteId || route.id == _selectedRouteId) {
+        return route.id;
+      }
+    }
+    for (final module in widget.plugin.uiModules) {
+      if (module.id == _selectedRouteId) {
+        return module.id;
+      }
+    }
+    return _selectedRouteId;
+  }
+
+  String _selectedRouteInstanceId() {
+    final uiModuleId = _selectedUiModuleId();
+    for (final route in widget.plugin.uiRoutes) {
+      if (route.routeId == _selectedRouteId || route.id == _selectedRouteId) {
+        return 'screen:${widget.plugin.packageName}:$uiModuleId';
+      }
+    }
+    return 'legacy:${widget.plugin.packageName}:$uiModuleId';
+  }
+
+  String _executionContextKey({
+    required String uiModuleId,
+    required String routeInstanceId,
+  }) {
+    final container = widget.plugin.packageName.trim().isEmpty
+        ? 'default'
+        : widget.plugin.packageName.trim();
+    final module = uiModuleId.trim().isEmpty ? 'default' : uiModuleId.trim();
+    final route = routeInstanceId.trim().isEmpty
+        ? 'default'
+        : routeInstanceId.trim();
+    final embeddedScreenPath = _embeddedScreenPath();
+    if (embeddedScreenPath != null) {
+      return 'toolpkg_xml_render:$container:$embeddedScreenPath:$_executionOwnerId';
+    }
+    return 'toolpkg_compose_dsl:$container:$module:$route:$_executionOwnerId';
+  }
+
+  /// Reads the embedded screen path without consulting optional module metadata.
+  String? _embeddedScreenPath() {
+    final path = widget.embeddedScreenPath;
+    if (path == null) return null;
+    final normalized = path.trim();
+    if (normalized.isEmpty) {
+      throw ArgumentError.value(
+        path,
+        'embeddedScreenPath',
+        'must not be blank',
+      );
+    }
+    return normalized;
+  }
+
+  String _currentLanguage() {
+    return _currentLanguageTag;
+  }
+
+  String _resolveCurrentLanguage() {
+    final tag = Localizations.localeOf(context).toLanguageTag().trim();
+    return tag.isEmpty ? 'en' : tag;
+  }
+
+  /// Applies navigation side effects after their render or action completes.
+  void _navigateCommands(
+    List<({String routeId, Map<String, Object?> args})> commands,
+  ) {
+    for (final command in commands) {
+      AppRouterGateway.navigate(
+        routeId: command.routeId,
+        args: command.args,
+        source: RouteEntrySource.script,
+      );
+    }
+  }
+
+  void _printComposeError(String phase, Object error, StackTrace stackTrace) {
+    final diagnostic = error is CoreLinkError
+        ? error.toDiagnosticString()
+        : error.toString();
+    debugPrint(
+      'ToolPkg compose_dsl $phase error: '
+      'package=${widget.plugin.packageName}, '
+      'route=$_selectedRouteId, '
+      'error=$diagnostic',
+    );
+    debugPrintStack(stackTrace: stackTrace);
+    ClientLogger.e(
+      'event=compose_dispatch_failed phase=$phase '
+      'package=${widget.plugin.packageName} route=$_selectedRouteId',
+      tag: _logTag,
+      error: error,
+      stackTrace: stackTrace,
+    );
+  }
+
+  Map<String, Object?> _moduleSpec(String routeId) {
+    final initialModuleSpec = widget.initialModuleSpec;
+    if (initialModuleSpec != null) {
+      return initialModuleSpec;
+    }
+    for (final route in widget.plugin.uiRoutes) {
+      if (route.routeId == routeId || route.id == routeId) {
+        return <String, Object?>{
+          'id': route.id,
+          'routeId': route.routeId,
+          'runtime': route.runtime,
+          'screen': route.screen,
+          'title': localizedText(route.title),
+          'toolPkgId': widget.plugin.packageName,
+          'keepAlive': route.keepAlive,
+        };
+      }
+    }
+    for (final module in widget.plugin.uiModules) {
+      if (module.id == routeId) {
+        return <String, Object?>{
+          'id': module.id,
+          'routeId': module.id,
+          'runtime': module.runtime,
+          'screen': module.screen,
+          'title': localizedText(module.title),
+          'toolPkgId': widget.plugin.packageName,
+          'keepAlive': module.keepAlive,
+        };
+      }
+    }
+    return <String, Object?>{
+      'routeId': routeId,
+      'toolPkgId': widget.plugin.packageName,
+    };
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final hasSelectedUi = _hasSelectedUi();
+    final uiModuleId = _selectedUiModuleId();
+    final routeInstanceId = _selectedRouteInstanceId();
+    final executionContextKey = _executionContextKey(
+      uiModuleId: uiModuleId,
+      routeInstanceId: routeInstanceId,
+    );
+    final routeGeneration = _actionOwnerGeneration;
+    final webViewHostContext = ComposeDslWebViewHostContext(
+      packageName: widget.plugin.packageName,
+      routeInstanceId: routeInstanceId,
+      executionContextKey: executionContextKey,
+      dispatchAction: _dispatchWebViewAction,
+      readFileBytes: (path) => readComposeDslVfsBytes(widget.clients, path),
+      onActionResultDelivered: (result) =>
+          _notifyActionResult(result, routeGeneration: routeGeneration),
+      runtimeOptionsProvider: () => _runtimeOptions(
+        uiModuleId: uiModuleId,
+        routeInstanceId: routeInstanceId,
+        executionContextKey: executionContextKey,
+      ),
+    );
+    final content = hasSelectedUi
+        ? _ComposeHost(
+            key: ValueKey(_selectedRouteId),
+            loading: _loading,
+            error: _error,
+            renderResult: _renderResult,
+            showLoadingIndicator: widget.showLoadingIndicator,
+            dialogTitle: widget.dialogTitle,
+            onAction: _dispatchAction,
+            onTextInput: _dispatchTextInput,
+            webViewHostContext: webViewHostContext,
+            splitMarkdownContent: (content) => widget
+                .clients
+                .chatRuntimeHolderMain
+                .splitMarkdownContent(content: content),
+          )
+        : const _NoUiView();
+    if (!widget.showLauncherChrome) {
+      return content;
+    }
+    return Scaffold(
+      appBar: AppBar(title: Text(toolPkgContainerDisplayName(widget.plugin))),
+      body: SafeArea(child: content),
+    );
+  }
+
+  bool _hasSelectedUi() {
+    if (_embeddedScreenPath() != null) {
+      return true;
+    }
+    for (final route in widget.plugin.uiRoutes) {
+      if (route.routeId == _selectedRouteId || route.id == _selectedRouteId) {
+        return true;
+      }
+    }
+    for (final module in widget.plugin.uiModules) {
+      if (module.id == _selectedRouteId) {
+        return true;
+      }
+    }
+    return false;
+  }
+}
