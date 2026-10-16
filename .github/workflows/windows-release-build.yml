@@ -49,6 +49,13 @@ jobs:
         with:
           node-version: 22
 
+      - name: Install built-in workflow plugin dependencies
+        working-directory: plugins/packages/buildin/workflow
+        shell: pwsh
+        run: |
+          corepack enable pnpm
+          corepack pnpm install --frozen-lockfile
+
       - name: Install FVM
         shell: pwsh
         run: |
