@@ -44,8 +44,6 @@ def main() -> int:
     ensure_typescript(TYPESCRIPT_VERSION)
     flutter_pub_get(enforce_lockfile=args.enforce_lockfile)
     command = [flutter_command(), "build", "windows", "--release", "--no-pub"]
-    # TEMP-DIAGNOSTIC: verbose output to surface the artifact download failure.
-    command.append("-v")
     if args.build_name:
         command.extend(["--build-name", args.build_name])
     if args.build_number:

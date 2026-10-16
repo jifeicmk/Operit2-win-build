@@ -10,6 +10,7 @@ from common import (
     FLUTTER_APP_DIR,
     RELEASE_DIR,
     copy_required_file,
+    ensure_typescript,
     flutter_command,
     flutter_pub_get,
     generate_dart_proxy_artifacts,
@@ -18,6 +19,9 @@ from common import (
     run,
     write_properties,
 )
+
+# Version of the repository-managed TypeScript compiler used by the plugin/codegen tooling.
+TYPESCRIPT_VERSION = "5.9.3"
 
 
 def ensure_android_signing() -> None:
@@ -107,6 +111,7 @@ def main() -> int:
     require_command("cargo")
     if not args.skip_proxy_generation:
         generate_dart_proxy_artifacts()
+    ensure_typescript(TYPESCRIPT_VERSION)
     flutter_pub_get(enforce_lockfile=args.enforce_lockfile)
     # Omit `--no-pub` on purpose: this build rewrites GeneratedPluginRegistrant.java
     # for release mode, dropping dev-only plugins (integration_test) that
