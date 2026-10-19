@@ -8,6 +8,7 @@ import type { GroupExecutionOutcome, GroupSubmission } from "./contracts";
 import { createGroupExecutionController } from "./domain-adapter";
 import { GroupExecutionController } from "./executor";
 import { NativeGroupTurnTransport } from "./native-transport";
+import { retainDetachedWork } from "./detached";
 
 /** Retains one exact admitted submission and its genuine asynchronous outcome for each conversation. */
 interface InputExecution {
@@ -69,6 +70,11 @@ export async function onGroupInputSubmit(event: ToolPkgTypes.ChatInputHookEvent)
   const execution: InputExecution = { input, status: "running", outcome: null, failure: null };
   executions.set(chatId, execution);
   observe(execution, work);
+  // The retained group sequence keeps running after this hook returns, so its host
+  // execution session must stay alive. Retaining one reference makes the runtime mark
+  // the call as detached and notify the host (JsLibraries.rs), instead of recycling it
+  // the moment the hook settles - which is what broke every group send.
+  retainDetachedWork(work);
   return { action: "Consume", clearInput: true, metadata: { submissionId: input.submissionId, chatId, selection: input.selection, runtime: input.runtime } };
 }
 
@@ -116,6 +122,8 @@ async function groupExecutionRequest(payload: GroupExecutionRequest): Promise<To
     const work = target.controller.resume(execution.input.chatId, execution.input.submissionId);
     execution.status = "running"; execution.outcome = null; execution.failure = null;
     observe(execution, work);
+    // Same lifetime as a fresh submission: resume returns before the sequence settles.
+    retainDetachedWork(work);
   }
   return jsonValue(executionStatus(execution));
 }
