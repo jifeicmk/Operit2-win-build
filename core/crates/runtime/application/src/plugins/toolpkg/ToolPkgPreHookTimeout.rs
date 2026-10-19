@@ -17,7 +17,7 @@ impl ToolPkgPreHookTimeout {
 
     /// Creates a deadline with the supplied whole-second duration.
     pub fn fromSeconds(seconds: i32) -> Self {
-        let durationMillis = i64::from(seconds.clamp(1, 60)) * 1000;
+        let durationMillis = i64::from(seconds.clamp(1, 600)) * 1000;
         Self {
             deadlineMillis: currentTimeMillis() + durationMillis,
         }

@@ -1,0 +1,49 @@
+--- src/memory-jobs/analysis.ts.orig
++++ src/memory-jobs/analysis.ts
+@@ -12,9 +12,44 @@
+ 
+ /** Parses only strict JSON or its explicitly documented complete Markdown fence. */
+ export function parseModelJson(text: string): unknown {
+-  assertString(text, "model output"); const trimmed = text.trim();
++  assertString(text, "model output");
++  const trimmed = text.trim();
++
++  // 1) The documented shape first: a bare object/array, or one complete fence.
+   const fence = /^```(?:json)?\s*\r?\n([\s\S]*?)\r?\n```\s*$/u.exec(trimmed);
+-  return JSON.parse(fence === null ? trimmed : fence[1]);
++  const primary = fence === null ? trimmed : fence[1];
++  try { return JSON.parse(primary); } catch { /* fall through to salvage */ }
++
++  // 2) Salvage the first complete JSON value from surrounding prose, a partial or
++  //    unterminated fence, or trailing chatter. Interchange and reasoning models
++  //    frequently wrap the object in explanation; that must not fail extraction.
++  const recovered = extractFirstJsonValue(trimmed);
++  if (recovered !== null) return JSON.parse(recovered);
++  return JSON.parse(primary);
++}
++
++/** Scans for the first balanced JSON object or array, ignoring braces inside strings. */
++function extractFirstJsonValue(text: string): string | null {
++  const opening = text.search(/[\[{]/u);
++  if (opening < 0) return null;
++  const open = text[opening], close = open === "{" ? "}" : "]";
++  let depth = 0, inString = false, escaped = false;
++  for (let index = opening; index < text.length; index += 1) {
++    const char = text[index];
++    if (inString) {
++      if (escaped) escaped = false;
++      else if (char === "\\") escaped = true;
++      else if (char === '"') inString = false;
++      continue;
++    }
++    if (char === '"') { inString = true; continue; }
++    if (char === open) depth += 1;
++    else if (char === close) {
++      depth -= 1;
++      if (depth === 0) return text.slice(opening, index + 1);
++    }
++  }
++  return null;
+ }
+ 
+ /** Checks each required named field before any domain record is modified. */

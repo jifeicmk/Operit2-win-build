@@ -2816,7 +2816,39 @@ function parseModelJson(text2) {
   assertString(text2, "model output");
   const trimmed = text2.trim();
   const fence = /^```(?:json)?\s*\r?\n([\s\S]*?)\r?\n```\s*$/u.exec(trimmed);
-  return JSON.parse(fence === null ? trimmed : fence[1]);
+  const primary = fence === null ? trimmed : fence[1];
+  try {
+    return JSON.parse(primary);
+  } catch {
+  }
+  const recovered = extractFirstJsonValue(trimmed);
+  if (recovered !== null) return JSON.parse(recovered);
+  return JSON.parse(primary);
+}
+function extractFirstJsonValue(text2) {
+  const opening2 = text2.search(/[\[{]/u);
+  if (opening2 < 0) return null;
+  const open = text2[opening2], close = open === "{" ? "}" : "]";
+  let depth = 0, inString = false, escaped = false;
+  for (let index = opening2; index < text2.length; index += 1) {
+    const char = text2[index];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') inString = false;
+      continue;
+    }
+    if (char === '"') {
+      inString = true;
+      continue;
+    }
+    if (char === open) depth += 1;
+    else if (char === close) {
+      depth -= 1;
+      if (depth === 0) return text2.slice(opening2, index + 1);
+    }
+  }
+  return null;
 }
 function entity(value, alias) {
   assertObject(value, "analysis entity");
@@ -5991,6 +6023,21 @@ function stateFromRecords(metadata, rows) {
     }
     entries.push(row.value.record);
   }
+  let nextIdentity = BigInt(requireDecimal(String(state.nextId), "nextId", true));
+  const advanceIdentity = (identity3) => {
+    const value = BigInt(requireDecimal(String(identity3), "stored identity", true));
+    if (value >= nextIdentity) nextIdentity = value + 1n;
+  };
+  for (const group of state.conversationGroups)
+    advanceIdentity(group.id);
+  for (const owner2 of state.owners) {
+    for (const field2 of ["memories", "links", "chunks", "candidates"])
+      for (const record2 of owner2[field2])
+        advanceIdentity(record2.id);
+    const task = owner2.rebuildTask;
+    if (task !== null && task !== void 0) advanceIdentity(task.id);
+  }
+  state.nextId = nextIdentity.toString();
   assertCharacterState(state);
   return state;
 }
@@ -10266,10 +10313,32 @@ var NativeGroupTurnTransport = class {
   }
 };
 
+// src/group-execution/detached.ts
+function retainDetachedWork(work) {
+  const scope = globalThis;
+  const callId = typeof scope.__operitCurrentCallId === "string" ? scope.__operitCurrentCallId : "";
+  const retain = scope.__operitRetainCallReference;
+  const release = scope.__operitReleaseCallReference;
+  if (callId === "" || typeof retain !== "function") return;
+  try {
+    retain(callId);
+  } catch {
+    return;
+  }
+  const dispose = () => {
+    try {
+      if (typeof release === "function") release(callId);
+    } catch {
+    }
+  };
+  void work.then(dispose, dispose);
+}
+
 // src/group-execution/hooks.ts
 var controller = null;
 var submissionSequence = 0;
 var executions = /* @__PURE__ */ new Map();
+var watchdogs = /* @__PURE__ */ new Map();
 function submission(payload, chatId, selection) {
   const { runtime: runtime2, text: text2, attachments } = payload;
   if (runtime2 === null) throw new Error("Group input requires an actual send-capable runtime slot");
@@ -10293,16 +10362,35 @@ function observe(execution, work) {
   void work.then(
     /** Publishes only the controller's validated result and precise native message locators. */
     (outcome) => {
+      clearWatchdog(execution);
       execution.status = "settled";
       execution.outcome = outcome;
     },
     /** Retains the original rejected error and exposes the background failure through the plugin log. */
     (failure2) => {
+      clearWatchdog(execution);
       execution.status = "failed";
       execution.failure = failure2;
       console.error("Group input " + execution.input.submissionId + " failed: " + String(failure2));
     }
   );
+  armWatchdog(execution);
+}
+var ADMISSION_TIMEOUT_MS = 6e5;
+function armWatchdog(execution) {
+  const timer = setTimeout(() => {
+    if (execution.status !== "running") return;
+    execution.status = "failed";
+    execution.failure = new Error("Group submission exceeded the local admission deadline");
+    console.error("Group input " + execution.input.submissionId + " watchdog released a stuck admission");
+  }, ADMISSION_TIMEOUT_MS);
+  watchdogs.set(execution, timer);
+}
+function clearWatchdog(execution) {
+  const timer = watchdogs.get(execution);
+  if (timer === void 0) return;
+  watchdogs.delete(execution);
+  clearTimeout(timer);
 }
 function onGroupInputSubmit(event) {
   return __async(this, null, function* () {
@@ -10324,6 +10412,7 @@ function onGroupInputSubmit(event) {
     const execution = { input, status: "running", outcome: null, failure: null };
     executions.set(chatId, execution);
     observe(execution, work);
+    retainDetachedWork(work);
     return { action: "Consume", clearInput: true, metadata: { submissionId: input.submissionId, chatId, selection: input.selection, runtime: input.runtime } };
   });
 }

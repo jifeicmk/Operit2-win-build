@@ -548,7 +548,7 @@ impl ApiPreferences {
             Ok(preferences
                 .getTyped::<i32>(&stringPreferencesKey("toolpkg_pre_hook_timeout_seconds"))?
                 .unwrap_or(Self::DEFAULT_TOOLPKG_PRE_HOOK_TIMEOUT_SECONDS)
-                .clamp(1, 60))
+                .clamp(1, 600))
         })
     }
 
@@ -732,7 +732,7 @@ impl ApiPreferences {
         self.apiDataStore.edit(|preferences| {
             preferences.set(
                 &stringPreferencesKey("toolpkg_pre_hook_timeout_seconds"),
-                seconds.clamp(1, 60),
+                seconds.clamp(1, 600),
             );
         })
     }
@@ -753,7 +753,7 @@ impl ApiPreferences {
         Ok(preferences
             .getTyped::<i32>(&stringPreferencesKey("toolpkg_pre_hook_timeout_seconds"))?
             .unwrap_or(Self::DEFAULT_TOOLPKG_PRE_HOOK_TIMEOUT_SECONDS)
-            .clamp(1, 60))
+            .clamp(1, 600))
     }
 
     /// Updates thinking settings in one edit transaction.

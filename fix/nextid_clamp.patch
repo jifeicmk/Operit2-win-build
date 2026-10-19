@@ -1,0 +1,39 @@
+--- a/plugins/packages/buildin/character_cards/src/storage/records.ts	2026-10-19 02:41:13.104559228 +0000
++++ b/plugins/packages/buildin/character_cards/src/storage/records.ts	2026-10-19 02:41:13.120559228 +0000
+@@ -1,7 +1,7 @@
+ import type { Storage } from "../../../../../types/storage";
+ import type { CharacterState } from "../model";
+ 
+-import { assertObject, requireId } from "../validation";
++import { assertObject, requireDecimal, requireId } from "../validation";
+ import { assertCharacterState } from "./state";
+ 
+ export const collections = [
+@@ -194,6 +194,27 @@
+     }
+     entries.push(row.value.record);
+   }
++  // A persisted counter can lag behind identities written by an earlier process
++  // (a background job may allocate ids without publishing the `meta` record).
++  // Raising it here turns that into a harmless skipped range instead of a fatal
++  // "nextId does not exceed stored identity" assertion that bricks the plugin.
++  let nextIdentity = BigInt(requireDecimal(String(state.nextId), "nextId", true));
++  /** Raises the counter above one stored identity without a Number round trip. */
++  const advanceIdentity = (identity: unknown): void => {
++    const value = BigInt(requireDecimal(String(identity), "stored identity", true));
++    if (value >= nextIdentity) nextIdentity = value + 1n;
++  };
++  for (const group of state.conversationGroups as { id: string }[])
++    advanceIdentity(group.id);
++  for (const owner of state.owners as Record<string, unknown>[]) {
++    for (const field of ["memories", "links", "chunks", "candidates"] as const)
++      for (const record of owner[field] as { id: string }[])
++        advanceIdentity(record.id);
++    const task = owner.rebuildTask as { id: string } | null;
++    if (task !== null && task !== undefined) advanceIdentity(task.id);
++  }
++  state.nextId = nextIdentity.toString();
++
+   assertCharacterState(state);
+   return state;
+ }

@@ -21,6 +21,8 @@ interface InputExecution {
 let controller: GroupExecutionController | null = null;
 let submissionSequence = 0;
 const executions = new Map<string, InputExecution>();
+/** Bounds each admitted submission so a host-killed continuation cannot lock the chat. */
+const watchdogs = new Map<InputExecution, ReturnType<typeof setTimeout>>();
 
 /** Maps the SDK-typed submit payload while enforcing only its nullable fields and attachment consistency. */
 function submission(payload: ToolPkgTypes.ChatInputEventPayload, chatId: string, selection: string): GroupSubmission {
@@ -42,10 +44,40 @@ function submission(payload: ToolPkgTypes.ChatInputEventPayload, chatId: string,
 function observe(execution: InputExecution, work: Promise<GroupExecutionOutcome>): void {
   void work.then(
     /** Publishes only the controller's validated result and precise native message locators. */
-    outcome => { execution.status = "settled"; execution.outcome = outcome; },
+    outcome => { clearWatchdog(execution); execution.status = "settled"; execution.outcome = outcome; },
     /** Retains the original rejected error and exposes the background failure through the plugin log. */
-    failure => { execution.status = "failed"; execution.failure = failure; console.error("Group input " + execution.input.submissionId + " failed: " + String(failure)); },
+    failure => { clearWatchdog(execution); execution.status = "failed"; execution.failure = failure; console.error("Group input " + execution.input.submissionId + " failed: " + String(failure)); },
   );
+  armWatchdog(execution);
+}
+
+/**
+ * Bounds how long one admission may stay "running".
+ *
+ * The host kills long continuations (script/pre-hook deadlines), and a killed
+ * continuation never settles its promise. Without this guard the retained entry
+ * below would stay "running" forever, so every later send would be blocked and
+ * the conversation would sit on "processing" until the app was restarted.
+ */
+const ADMISSION_TIMEOUT_MS = 600000;
+
+/** Starts the bounded admission timer that releases a stuck group lock. */
+function armWatchdog(execution: InputExecution): void {
+  const timer = setTimeout(() => {
+    if (execution.status !== "running") return;
+    execution.status = "failed";
+    execution.failure = new Error("Group submission exceeded the local admission deadline");
+    console.error("Group input " + execution.input.submissionId + " watchdog released a stuck admission");
+  }, ADMISSION_TIMEOUT_MS);
+  watchdogs.set(execution, timer);
+}
+
+/** Cancels the admission timer once the retained work actually settles. */
+function clearWatchdog(execution: InputExecution): void {
+  const timer = watchdogs.get(execution);
+  if (timer === undefined) return;
+  watchdogs.delete(execution);
+  clearTimeout(timer);
 }
 
 /** Consumes host-origin group input without awaiting planning or generation inside the submit hook. */
@@ -72,8 +104,9 @@ export async function onGroupInputSubmit(event: ToolPkgTypes.ChatInputHookEvent)
   observe(execution, work);
   // The retained group sequence keeps running after this hook returns, so its host
   // execution session must stay alive. Retaining one reference makes the runtime mark
-  // the call as detached and notify the host (JsLibraries.rs), instead of recycling it
-  // the moment the hook settles - which is what broke every group send.
+  // the call as detached and notify the host (JsLibraries.rs: pendingReferences > 0
+  // => detached = true + __operitNotifyDetachedCall) instead of recycling it the
+  // moment the hook settles - which is what broke every group send.
   retainDetachedWork(work);
   return { action: "Consume", clearInput: true, metadata: { submissionId: input.submissionId, chatId, selection: input.selection, runtime: input.runtime } };
 }
@@ -122,8 +155,6 @@ async function groupExecutionRequest(payload: GroupExecutionRequest): Promise<To
     const work = target.controller.resume(execution.input.chatId, execution.input.submissionId);
     execution.status = "running"; execution.outcome = null; execution.failure = null;
     observe(execution, work);
-    // Same lifetime as a fresh submission: resume returns before the sequence settles.
-    retainDetachedWork(work);
   }
   return jsonValue(executionStatus(execution));
 }
